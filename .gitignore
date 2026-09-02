@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+_classificados/
+_log/
+_log_rejeitados/
+_log_bat/
+_enviados.txt
+*.ret
+*.RET
