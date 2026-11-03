@@ -4,9 +4,9 @@
 email_rejeitados.py — envia por email a relacao de pagamentos REJEITADOS
 ========================================================================
 
-Le as pastas <classificados>/<TIPO>/REJEITADO geradas pelo classificar.py,
+Le todas as pastas de status geradas pelo classificar.py,
 extrai cada pagamento rejeitado (favorecido, valor, motivo) dos arquivos de
-retorno (CNAB 240 / segmento A) e envia a relacao por email (tabela + CSV).
+retorno (CNAB 240 / segmentos A e J) e envia a relacao por email (tabela + CSV).
 
 Recursos:
     - FILTRAR_MES_ATUAL : so rejeitados com data de pagamento no mes atual em diante.
@@ -28,6 +28,8 @@ Ou edite os defaults na secao CONFIG abaixo.
 
 import os
 import csv
+import hashlib
+import json
 import smtplib
 import datetime
 from email.mime.multipart import MIMEMultipart
@@ -103,17 +105,26 @@ def extrair_rejeitados(caminho):
             linha = linha.rstrip("\r\n")
             if len(linha) < POS_OCORR[1]:
                 continue
-            if linha[POS_TIPO_REGISTRO] != "3" or linha[POS_SEGMENTO] != "A":
+            segmento = linha[POS_SEGMENTO]
+            if linha[POS_TIPO_REGISTRO] != "3" or segmento not in {"A", "J"}:
                 continue
             campo = linha[POS_OCORR[0]:POS_OCORR[1]]
             codigos = [campo[i:i + 2].strip() for i in range(0, 10, 2)]
             rej = [c for c in codigos if c in CODIGOS_REJEITADO]
             if not rej:
                 continue
-            nome = linha[POS_NOME[0]:POS_NOME[1]].strip()
-            valor_raw = linha[POS_VALOR[0]:POS_VALOR[1]].strip()
+            # J: nome 62-91, data do pagamento 145-152, valor 153-167.
+            # J-52 e complemento cadastral, nao um pagamento.
+            if segmento == "J" and linha[17:19] == "52":
+                continue
+            pos_nome, pos_valor, pos_data = (
+                ((61, 91), (152, 167), (144, 152)) if segmento == "J"
+                else (POS_NOME, POS_VALOR, POS_DATA)
+            )
+            nome = linha[slice(*pos_nome)].strip()
+            valor_raw = linha[slice(*pos_valor)].strip()
             valor = int(valor_raw) / 100 if valor_raw.isdigit() else 0.0
-            data_raw = linha[POS_DATA[0]:POS_DATA[1]].strip()
+            data_raw = linha[slice(*pos_data)].strip()
             data_fmt = (f"{data_raw[0:2]}/{data_raw[2:4]}/{data_raw[4:8]}"
                         if len(data_raw) == 8 and data_raw.isdigit() else data_raw)
             try:
@@ -127,6 +138,7 @@ def extrair_rejeitados(caminho):
                 "data": data_fmt,
                 "_data_ord": data_ord,
                 "_seq": len(itens),
+                "_registro_id": hashlib.sha256(linha.encode("latin-1")).hexdigest(),
             })
     return itens
 
@@ -138,8 +150,11 @@ def coletar():
     registros = []
     for base in CLASSIFICADOS:
         emp = rotulo(base)
-        for tipo in TIPOS:
-            pasta = os.path.join(base, tipo, "REJEITADO")
+        pastas = [(tipo, os.path.join(base, tipo, status))
+                  for tipo in TIPOS
+                  for status in ("REJEITADO", "LIQUIDADO", "AGENDADO", "REVISAR")]
+        pastas.append(("REVISAR", os.path.join(base, "_REVISAR")))
+        for tipo, pasta in pastas:
             if not os.path.isdir(pasta):
                 continue
             for nome_arq in sorted(os.listdir(pasta)):
@@ -149,7 +164,8 @@ def coletar():
                 if not os.path.isfile(caminho):
                     continue
                 for item in extrair_rejeitados(caminho):
-                    item.update(empresa=emp, tipo=tipo, arquivo=nome_arq)
+                    item.update(empresa=emp, tipo=tipo, arquivo=nome_arq,
+                                _origem=os.path.normcase(os.path.realpath(base)))
                     registros.append(item)
     if FILTRAR_MES_ATUAL:
         hoje = datetime.date.today()
@@ -239,7 +255,10 @@ def salvar_enviados(chaves):
 
 
 def chave(r):
-    return f"{r['empresa']}|{r['arquivo']}|{r['_seq']}"
+    identidade = [r["_origem"], r["tipo"], r["_registro_id"]]
+    return "v2:" + hashlib.sha256(
+        json.dumps(identidade, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
 
 
 def main():
@@ -250,7 +269,15 @@ def main():
     registros = coletar()
     if EVITAR_REPETIDOS:
         enviados = carregar_enviados()
-        novos = [r for r in registros if chave(r) not in enviados]
+        if any(not c.startswith("v2:") for c in enviados):
+            print("AVISO: ledger antigo detectado; registros serao reavaliados com chaves v2.")
+        novos = []
+        vistos = set(enviados)
+        for r in registros:
+            identificador = chave(r)
+            if identificador not in vistos:
+                novos.append(r)
+                vistos.add(identificador)
         print(f"Ja enviados antes: {len(registros) - len(novos)} | novos: {len(novos)}")
     else:
         novos = registros
@@ -276,3 +303,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
