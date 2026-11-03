@@ -72,14 +72,14 @@ def categoria_tipo(tipo_pgto, forma_pgto):
 def categoria_status(ocorrencias):
     if not ocorrencias:
         return "REVISAR", "nenhuma ocorrencia lida"
+    rej = sorted(set(c for c in ocorrencias if c in CODIGOS_REJEITADO))
+    if rej:
+        return "REJEITADO", f"rejeicao: {rej}"
     if any(c in CODIGOS_LIQUIDADO for c in ocorrencias):
         outros = sorted(set(c for c in ocorrencias if c not in CODIGOS_LIQUIDADO))
         if outros:
             return "LIQUIDADO", f"liquidado presente (tambem ha: {outros})"
         return "LIQUIDADO", f"todos efetuados: {sorted(set(ocorrencias))}"
-    rej = sorted(set(c for c in ocorrencias if c in CODIGOS_REJEITADO))
-    if rej:
-        return "REJEITADO", f"rejeicao: {rej}"
     age = sorted(set(c for c in ocorrencias if c in CODIGOS_AGENDADO))
     if age:
         return "AGENDADO", f"agendado: {age}"
@@ -147,11 +147,32 @@ def garantir_pastas(base_saida, revisar_raiz, pasta_log):
 
 
 def _destino_unico(pasta, origem):
-    destino = os.path.join(pasta, os.path.basename(origem))
-    if os.path.exists(destino):
-        nome, ext = os.path.splitext(os.path.basename(origem))
-        carimbo = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        destino = os.path.join(pasta, f"{nome}_{carimbo}{ext}")
+    """Reserva atomicamente um destino; o chamador deve preencher ou remover."""
+    nome, ext = os.path.splitext(os.path.basename(origem))
+    tentativa = 0
+    while True:
+        sufixo = f"_{tentativa}" if tentativa else ""
+        destino = os.path.join(pasta, f"{nome}{sufixo}{ext}")
+        try:
+            fd = os.open(destino, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            tentativa += 1
+            continue
+        os.close(fd)
+        return destino
+
+
+def _transferir_seguro(origem, pasta, copiar):
+    destino = _destino_unico(pasta, origem)
+    try:
+        shutil.copy2(origem, destino)
+    except BaseException:
+        os.unlink(destino)
+        raise
+    # So remove a origem depois de concluir a copia. Se a remocao falhar,
+    # preserva ambas as copias para nao perder o retorno.
+    if not copiar:
+        os.unlink(origem)
     return destino
 
 
@@ -159,21 +180,14 @@ def transferir(origem, tipo, status, cfg):
     pasta = cfg["revisar_raiz"] if tipo is None else os.path.join(cfg["base_saida"], tipo, status)
     if cfg["dry_run"]:
         return os.path.join(pasta, os.path.basename(origem))
-    destino = _destino_unico(pasta, origem)
-    if cfg["copiar"]:
-        shutil.copy2(origem, destino)
-    else:
-        shutil.move(origem, destino)
-    return destino
+    return _transferir_seguro(origem, pasta, cfg["copiar"])
 
 
 def transferir_copia(origem, tipo, status, cfg):
     pasta = os.path.join(cfg["base_saida"], tipo, status)
     if cfg["dry_run"]:
         return os.path.join(pasta, os.path.basename(origem))
-    destino = _destino_unico(pasta, origem)
-    shutil.copy2(origem, destino)
-    return destino
+    return _transferir_seguro(origem, pasta, True)
 
 
 # ============================================================
@@ -264,3 +278,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
